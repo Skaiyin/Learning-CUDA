@@ -1,5 +1,4 @@
 #include <vector>
-
 #include "../tester/utils.h"
 
 /**
@@ -24,7 +23,7 @@ __global__ void partition_and_count_kernel(
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = gridDim.x * blockDim.x;
     
-    // 第一阶段：原子计数
+    // 第一阶段：原子计数 - 统计小于、等于和大于pivot的元素数量
     for (size_t i = tid; i < n; i += stride) {
         if (data[i] < pivot) {
             atomicAdd(&counts[0], 1);
@@ -36,14 +35,14 @@ __global__ void partition_and_count_kernel(
     }
     __syncthreads();
 
-    // 第二阶段：实际分区
+    // 第二阶段：实际分区 - 将元素分类到临时数组中
     for (size_t i = tid; i < n; i += stride) {
         if (data[i] < pivot) {
             int pos = atomicAdd(less_idx, 1);
             temp[pos] = data[i];
         } else if (data[i] > pivot) {
             int pos = atomicAdd(greater_idx, 1);
-            temp[n - 1 - pos] = data[i]; // 反向存储
+            temp[n - 1 - pos] = data[i]; // 反向存储以便后续合并
         }
     }
 }
@@ -71,8 +70,9 @@ T kthLargest(const std::vector<T>& h_input, size_t k) {
 
     const int blockSize = 256;
 
+    // 使用快速选择算法查找第k大元素
     while (left < right) {
-        // 1. 选择pivot（改进为随机选择更好）
+        // 1. 选择pivot（简单选择中间元素，可改进为随机选择）
         T pivot;
         cudaMemcpy(&pivot, &d_data[left + (right - left)/2], sizeof(T), cudaMemcpyDeviceToHost);
 
@@ -102,13 +102,16 @@ T kthLargest(const std::vector<T>& h_input, size_t k) {
         cudaMemcpy(d_data + left + less + equal, d_temp + (right-left) - greater, 
                   greater * sizeof(T), cudaMemcpyDeviceToDevice);
 
-        // 6. 决定搜索范围
+        // 6. 决定下一步搜索范围
         if (target_k <= greater) {
+            // 第k大元素在较大分区
             left = left + less + equal;
         } else if (target_k <= greater + equal) {
+            // 找到目标元素
             result = pivot;
             break;
         } else {
+            // 第k大元素在较小分区
             right = left + less;
             target_k -= (greater + equal);
         }
@@ -141,163 +144,253 @@ T kthLargest(const std::vector<T>& h_input, size_t k) {
  * @param[in] is_causal Whether to apply causal masking
  */
 template<typename T>
-__global__ void computeAttentionScores(
-    const T* q, const T* k, T* scores,
-    int batch_size, int target_seq_len, int src_seq_len,
-    int query_heads, int kv_heads, int head_dim,
-    T scale, bool is_causal) {
+struct OnlineState {
+    T max_val;
+    T sum_exp;
     
-    int batch = blockIdx.x;
-    int q_head = blockIdx.y;
-    int i = blockIdx.z;
-    int j = threadIdx.x;
-    
-    if (batch >= batch_size || q_head >= query_heads || 
-        i >= target_seq_len || j >= src_seq_len) return;
-    
-    int head_group_size = query_heads / kv_heads;
-    int kv_head = q_head / head_group_size;
-    
-    T score = static_cast<T>(0);
-    for (int d = 0; d < head_dim; ++d) {
-        int q_idx = batch * target_seq_len * query_heads * head_dim + 
-                   i * query_heads * head_dim + q_head * head_dim + d;
-        int k_idx = batch * src_seq_len * kv_heads * head_dim + 
-                   j * kv_heads * head_dim + kv_head * head_dim + d;
-        
-        score += q[q_idx] * k[k_idx];
-    }
-    
-    score *= scale;
-    
-    if (is_causal && j > i) {
-        score = -static_cast<T>(1e30);
-    }
-    
-    int score_idx = batch * query_heads * target_seq_len * src_seq_len +
-                   q_head * target_seq_len * src_seq_len +
-                   i * src_seq_len + j;
-    scores[score_idx] = score;
-    
-    // Handle case where we have more threads than src_seq_len
-    for (int jj = j + blockDim.x; jj < src_seq_len; jj += blockDim.x) {
-        T score_extra = static_cast<T>(0);
-        for (int d = 0; d < head_dim; ++d) {
-            int q_idx = batch * target_seq_len * query_heads * head_dim + 
-                       i * query_heads * head_dim + q_head * head_dim + d;
-            int k_idx = batch * src_seq_len * kv_heads * head_dim + 
-                       jj * kv_heads * head_dim + kv_head * head_dim + d;
-            
-            score_extra += q[q_idx] * k[k_idx];
-        }
-        
-        score_extra *= scale;
-        
-        if (is_causal && jj > i) {
-            score_extra = -static_cast<T>(1e30);
-        }
-        
-        int score_idx_extra = batch * query_heads * target_seq_len * src_seq_len +
-                             q_head * target_seq_len * src_seq_len +
-                             i * src_seq_len + jj;
-        scores[score_idx_extra] = score_extra;
+    __device__ OnlineState() : max_val(-1e30f), sum_exp(0.0f) {}
+};
+
+template<typename T>
+__device__ void updateState(OnlineState<T>& state, T new_max, T new_sum) {
+    // 在线更新最大值和指数和，保持数值稳定性
+    if (new_max > state.max_val) {
+        T scale = expf(state.max_val - new_max);
+        state.sum_exp = fmaf(state.sum_exp, scale, new_sum);
+        state.max_val = new_max;
+    } else {
+        T scale = expf(new_max - state.max_val);
+        state.sum_exp = fmaf(new_sum, scale, state.sum_exp);
     }
 }
 
+// Warp级别的归约操作
 template<typename T>
-__global__ void applySoftmax(
-    const T* scores, T* weights,
-    int batch_size, int query_heads, int target_seq_len, int src_seq_len,
-    bool is_causal) {
+__device__ T warpReduceMax(T val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+template<typename T>
+__device__ T warpReduceSum(T val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+// Block级别的归约操作
+template<typename T>
+__device__ T blockReduceMax(T val, T* shared_mem) {
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    
+    // Warp内归约
+    val = warpReduceMax(val);
+    
+    // 每个warp的结果存到shared memory
+    if (lane_id == 0) {
+        shared_mem[warp_id] = val;
+    }
+    __syncthreads();
+    
+    // 最后一个warp处理所有warp的结果
+    if (warp_id == 0) {
+        val = (lane_id < (blockDim.x + 31) / 32) ? shared_mem[lane_id] : -1e30f;
+        val = warpReduceMax(val);
+    }
+    
+    return val;
+}
+
+template<typename T>
+__device__ T blockReduceSum(T val, T* shared_mem) {
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    
+    // Warp内归约
+    val = warpReduceSum(val);
+    
+    // 每个warp的结果存到shared memory
+    if (lane_id == 0) {
+        shared_mem[warp_id] = val;
+    }
+    __syncthreads();
+    
+    // 最后一个warp处理所有warp的结果
+    if (warp_id == 0) {
+        val = (lane_id < (blockDim.x + 31) / 32) ? shared_mem[lane_id] : 0.0f;
+        val = warpReduceSum(val);
+    }
+    
+    return val;
+}
+
+// Flash Attention核心算法实现
+template<typename T>
+__global__ void flashAttentionKernel(
+    const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v, T* __restrict__ output,
+    int batch_size, int target_seq_len, int src_seq_len,
+    int query_heads, int kv_heads, int head_dim,
+    T scale, bool is_causal, int kv_block_size) {
     
     int batch = blockIdx.x;
     int q_head = blockIdx.y;
     int i = blockIdx.z;
+    int tid = threadIdx.x;
     
     if (batch >= batch_size || q_head >= query_heads || i >= target_seq_len) return;
     
-    int base_idx = batch * query_heads * target_seq_len * src_seq_len +
-                   q_head * target_seq_len * src_seq_len +
-                   i * src_seq_len;
-    
-    // Find max for numerical stability
-    T max_score = -static_cast<T>(1e30);
-    int valid_count = 0;
-    for (int j = 0; j < src_seq_len; ++j) {
-        if (!is_causal || j <= i) {
-            T current_score = scores[base_idx + j];
-            max_score = (max_score > current_score) ? max_score : current_score;
-            valid_count++;
-        }
-    }
-    
-    // Handle case where all positions are masked
-    if (valid_count == 0) {
-        for (int j = 0; j < src_seq_len; ++j) {
-            weights[base_idx + j] = static_cast<T>(0);
-        }
-        return;
-    }
-    
-    // Compute exp and sum
-    T sum_exp = static_cast<T>(0);
-    for (int j = 0; j < src_seq_len; ++j) {
-        if (is_causal && j > i) {
-            weights[base_idx + j] = static_cast<T>(0);
-        } else {
-            T exp_val;
-            if constexpr (std::is_same_v<T, float>) {
-                exp_val = expf(scores[base_idx + j] - max_score);
-            } else {
-                exp_val = exp(scores[base_idx + j] - max_score);
-            }
-            weights[base_idx + j] = exp_val;
-            sum_exp += exp_val;
-        }
-    }
-    
-    // Normalize
-    if (sum_exp > static_cast<T>(0)) {
-        T inv_sum = static_cast<T>(1) / sum_exp;
-        for (int j = 0; j < src_seq_len; ++j) {
-            weights[base_idx + j] *= inv_sum;
-        }
-    }
-}
-
-template<typename T>
-__global__ void computeOutput(
-    const T* weights, const T* v, T* output,
-    int batch_size, int target_seq_len, int src_seq_len,
-    int query_heads, int kv_heads, int head_dim) {
-    
-    int batch = blockIdx.x;
-    int q_head = blockIdx.y;
-    int i = blockIdx.z;
-    int d = threadIdx.x;
-    
-    if (batch >= batch_size || q_head >= query_heads || 
-        i >= target_seq_len || d >= head_dim) return;
-    
+    // 计算对应的KV头（支持分组查询注意力）
     int head_group_size = query_heads / kv_heads;
     int kv_head = q_head / head_group_size;
     
-    T output_val = static_cast<T>(0);
+    // 计算有效的K/V长度（因果掩码时限制为当前位置）
+    int valid_kv_len = is_causal ? (i + 1) : src_seq_len;
+    int num_blocks = (valid_kv_len + kv_block_size - 1) / kv_block_size;
     
-    int weight_base = batch * query_heads * target_seq_len * src_seq_len +
-                     q_head * target_seq_len * src_seq_len +
-                     i * src_seq_len;
+    // Shared memory布局
+    extern __shared__ T shared_mem[];
+    T* shared_reduction = shared_mem;
+    T* shared_scores = shared_reduction + ((blockDim.x + 31) / 32);
+    T* shared_output = shared_scores + kv_block_size;
     
-    for (int j = 0; j < src_seq_len; ++j) {
-        int v_idx = batch * src_seq_len * kv_heads * head_dim + 
-                   j * kv_heads * head_dim + kv_head * head_dim + d;
+    // 初始化输出累加器
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        shared_output[d] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Flash Attention状态（在线softmax）
+    OnlineState<T> flash_state;
+    
+    // Q的基础索引
+    int q_base = batch * target_seq_len * query_heads * head_dim + 
+                 i * query_heads * head_dim + q_head * head_dim;
+    
+    // 分块处理K/V序列
+    for (int block_idx = 0; block_idx < num_blocks; ++block_idx) {
+        int kv_start = block_idx * kv_block_size;
+        int kv_end = min(kv_start + kv_block_size, valid_kv_len);
+        int current_block_size = kv_end - kv_start;
         
-        output_val += weights[weight_base + j] * v[v_idx];
+        if (current_block_size <= 0) break;
+        
+        // 步骤1：计算当前块的attention scores
+        for (int j = tid; j < current_block_size; j += blockDim.x) {
+            int global_j = kv_start + j;
+            T score = 0.0f;
+            
+            // 使用Kahan求和提高精度
+            T c = 0.0f; // 补偿项
+            for (int d = 0; d < head_dim; ++d) {
+                T q_val = q[q_base + d];
+                T k_val = k[batch * src_seq_len * kv_heads * head_dim + 
+                           global_j * kv_heads * head_dim + kv_head * head_dim + d];
+                
+                T product = q_val * k_val;
+                T y = product - c;
+                T t = score + y;
+                c = (t - score) - y;
+                score = t;
+            }
+            
+            score *= scale;
+            
+            // 应用因果掩码
+            if (is_causal && global_j > i) {
+                score = -1e30f;
+            }
+            
+            shared_scores[j] = score;
+        }
+        __syncthreads();
+        
+        // 步骤2：找到块内最大值（用于数值稳定的softmax）
+        T block_max = -1e30f;
+        for (int j = tid; j < current_block_size; j += blockDim.x) {
+            block_max = fmaxf(block_max, shared_scores[j]);
+        }
+        block_max = blockReduceMax(block_max, shared_reduction);
+        
+        // 步骤3：计算exp和
+        T block_sum = 0.0f;
+        for (int j = tid; j < current_block_size; j += blockDim.x) {
+            T exp_score = expf(shared_scores[j] - block_max);
+            shared_scores[j] = exp_score;
+            block_sum += exp_score;
+        }
+        block_sum = blockReduceSum(block_sum, shared_reduction);
+        __syncthreads();
+        
+        // 步骤4：更新全局状态
+        OnlineState<T> old_state = flash_state;
+        if (tid == 0) {
+            updateState(flash_state, block_max, block_sum);
+        }
+        
+        // 广播状态到所有线程
+        if (tid == 0) {
+            shared_reduction[0] = flash_state.max_val;
+            shared_reduction[1] = flash_state.sum_exp;
+            shared_reduction[2] = old_state.max_val;
+            shared_reduction[3] = old_state.sum_exp;
+        }
+        __syncthreads();
+        
+        T new_max = shared_reduction[0];
+        T new_sum = shared_reduction[1];
+        T old_max = shared_reduction[2];
+        T old_sum = shared_reduction[3];
+        
+        flash_state.max_val = new_max;
+        flash_state.sum_exp = new_sum;
+        
+        // 步骤5：重新缩放之前的输出
+        T rescale_factor = (old_sum > 1e-10f) ? expf(old_max - new_max) : 0.0f;
+        
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            shared_output[d] *= rescale_factor;
+        }
+        __syncthreads();
+        
+        // 步骤6：累加当前块的贡献
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            T weighted_sum = 0.0f;
+            T c = 0.0f; // Kahan求和补偿项
+            
+            for (int j = 0; j < current_block_size; ++j) {
+                int global_j = kv_start + j;
+                T weight = shared_scores[j];
+                
+                T v_val = v[batch * src_seq_len * kv_heads * head_dim + 
+                           global_j * kv_heads * head_dim + kv_head * head_dim + d];
+                
+                T product = weight * v_val;
+                T y = product - c;
+                T t = weighted_sum + y;
+                c = (t - weighted_sum) - y;
+                weighted_sum = t;
+            }
+            
+            shared_output[d] += weighted_sum;
+        }
+        __syncthreads();
     }
     
-    int o_idx = batch * target_seq_len * query_heads * head_dim + 
-               i * query_heads * head_dim + q_head * head_dim + d;
-    output[o_idx] = output_val;
+    // 步骤7：最终归一化并写入输出
+    T inv_sum = (flash_state.sum_exp > 1e-10f) ? (1.0f / flash_state.sum_exp) : 0.0f;
+    
+    int output_base = batch * target_seq_len * query_heads * head_dim + 
+                     i * query_heads * head_dim + q_head * head_dim;
+    
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        output[output_base + d] = shared_output[d] * inv_sum;
+    }
 }
 
 template <typename T>
@@ -306,60 +399,62 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int batch_size, int target_seq_len, int src_seq_len,
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {
     
-    T scale = static_cast<T>(1.0) / static_cast<T>(sqrt(static_cast<double>(head_dim)));
+    T scale = static_cast<T>(1.0) / sqrtf(static_cast<T>(head_dim));
     
     size_t q_size = batch_size * target_seq_len * query_heads * head_dim;
     size_t k_size = batch_size * src_seq_len * kv_heads * head_dim;
     size_t v_size = batch_size * src_seq_len * kv_heads * head_dim;
     size_t o_size = batch_size * target_seq_len * query_heads * head_dim;
-    size_t scores_size = batch_size * query_heads * target_seq_len * src_seq_len;
     
-    // Allocate GPU memory
-    T *d_q, *d_k, *d_v, *d_o, *d_scores, *d_weights;
+    // GPU内存分配
+    T *d_q, *d_k, *d_v, *d_o;
     
     cudaMalloc(&d_q, q_size * sizeof(T));
     cudaMalloc(&d_k, k_size * sizeof(T));
     cudaMalloc(&d_v, v_size * sizeof(T));
     cudaMalloc(&d_o, o_size * sizeof(T));
-    cudaMalloc(&d_scores, scores_size * sizeof(T));
-    cudaMalloc(&d_weights, scores_size * sizeof(T));
     
-    // Copy input data to GPU
+    // 初始化输出为0
+    cudaMemset(d_o, 0, o_size * sizeof(T));
+    
+    // 拷贝输入数据
     cudaMemcpy(d_q, h_q.data(), q_size * sizeof(T), cudaMemcpyHostToDevice);
     cudaMemcpy(d_k, h_k.data(), k_size * sizeof(T), cudaMemcpyHostToDevice);
     cudaMemcpy(d_v, h_v.data(), v_size * sizeof(T), cudaMemcpyHostToDevice);
     
-    // Launch kernels
-    dim3 grid1(batch_size, query_heads, target_seq_len);
-    dim3 block1(min(src_seq_len, 1024));
-    computeAttentionScores<<<grid1, block1>>>(
-        d_q, d_k, d_scores, batch_size, target_seq_len, src_seq_len,
-        query_heads, kv_heads, head_dim, scale, is_causal);
+    // 动态调整KV块大小
+    int kv_block_size = min(128, src_seq_len);
+    if (src_seq_len <= 512) {
+        kv_block_size = min(64, src_seq_len);
+    }
     
-    dim3 grid2(batch_size, query_heads, target_seq_len);
-    applySoftmax<<<grid2, 1>>>(
-        d_scores, d_weights, batch_size, query_heads, 
-        target_seq_len, src_seq_len, is_causal);
+    // 计算shared memory需求
+    size_t warp_count = (128 + 31) / 32;
+    size_t shared_mem_size = (warp_count + kv_block_size + head_dim) * sizeof(T);
     
-    dim3 grid3(batch_size, query_heads, target_seq_len);
-    dim3 block3(min(head_dim, 1024));
-    computeOutput<<<grid3, block3>>>(
-        d_weights, d_v, d_o, batch_size, target_seq_len, src_seq_len,
-        query_heads, kv_heads, head_dim);
+    // 启动kernel
+    dim3 grid(batch_size, query_heads, target_seq_len);
+    dim3 block(128);
     
-    // Copy result back to host
+    flashAttentionKernel<<<grid, block, shared_mem_size>>>(
+        d_q, d_k, d_v, d_o,
+        batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim,
+        scale, is_causal, kv_block_size
+    );
+    
+    // 拷贝结果
     cudaMemcpy(h_o.data(), d_o, o_size * sizeof(T), cudaMemcpyDeviceToHost);
     
-    // Free GPU memory
+    // 清理
     cudaFree(d_q);
     cudaFree(d_k);
     cudaFree(d_v);
     cudaFree(d_o);
-    cudaFree(d_scores);
-    cudaFree(d_weights);
     
     cudaDeviceSynchronize();
 }
+
 // *********************************************************************
 // Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
 // DO NOT MODIFY THIS SECTION
